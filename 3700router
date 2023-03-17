@@ -1,0 +1,300 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, json, select, copy, struct
+
+forwarding_table = []
+previous_updates = []
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+    
+    # return our address with last octet as 1
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+         
+    # return given network's address with last octet as 2
+    def neighbor_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split("."))
+        quads[3] = 2
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+    
+    # send given message to given network
+    def send(self, network, message):
+        print("Sending '%s' on %s" % (message, network))
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    # send announcement
+    def sendAnnouncement(self, msg, sock):
+        msg["src"] = self.our_addr(sock)
+        # addr of other neighbor, w 1 at end
+        msg["dst"] = self.neighbor_addr(sock)
+        print("Sending '%s' to router(%s) on %s" % (msg, msg["dst"], sock))
+        # convert into a json string
+        message = json.dumps(msg)
+        # send to other neighbor
+        self.send(sock, message)
+
+    # determine where to send announcement
+    def initiateAnnouncement(self, msg, srcif):
+        srcType = self.relations[msg["src"]]
+        if srcType == "cust":
+            for sock in self.sockets:
+                if sock != srcif:
+                    self.sendAnnouncement(msg, sock)
+        else:
+            for sock in self.sockets:
+                sockType = self.relations[sock]
+                if sock != srcif and sockType == "cust":
+                    self.sendAnnouncement(msg, sock)
+
+    # return whether the given IP address matches the given forwarding table entry
+    def entryMatches(self, table_entry, dest):
+        destination = int.from_bytes(socket.inet_aton(dest), "big")
+        netmask = int.from_bytes(socket.inet_aton(table_entry["netmask"]), "big")
+        network = int.from_bytes(socket.inet_aton(table_entry["network"]), "big")
+        return (network & netmask) == (destination & netmask)
+
+    # convert netmask ip address to cidr int 
+    def netmask_to_cidr(self, netmask):
+        count = 0
+        for num in netmask.split("."):
+            count += str(bin(int(num))).count("1")
+        return count
+
+    # check if update message matches withdraw message
+    def checkUpdateWithdrawMatch(self, update, withdraw_msg):
+        # if networks in message match
+        if withdraw_msg["src"] == update["src"]:
+            for withdraw_dic in withdraw_msg["msg"]:
+                if (update["msg"]["network"] == withdraw_dic["network"] and update["msg"]["netmask"] == withdraw_dic["netmask"]):
+                    return True
+        return False
+
+    # add new entry to forwarding table
+    def updateForwardingTable(self, new_entry):
+        for entry in forwarding_table.copy():
+            potential_aggregate = self.aggregateRoutes(new_entry, entry)
+            if potential_aggregate is not None:
+                forwarding_table.remove(entry)
+                self.updateForwardingTable(potential_aggregate)
+                return 
+        forwarding_table.append(new_entry)
+
+    # aggregate routes into one, if possible
+    def aggregateRoutes(self, route_1, route_2):
+        if (
+            route_1["peer"] != route_2["peer"]
+            or self.netmask_to_cidr(route_1["netmask"]) != self.netmask_to_cidr(route_2["netmask"])
+            or route_1["src"] != route_2["src"]
+            or route_1["localpref"] != route_2["localpref"]
+            or route_1["ASPath"] != route_2["ASPath"]
+            or route_1["selfOrigin"] != route_2["selfOrigin"]
+            or route_1["origin"] != route_2["origin"]
+        ):
+            return None
+            
+        smaller_netmask = socket.inet_ntoa(struct.pack("!L", (2**32 - 2 ** (32 - (self.netmask_to_cidr(route_1["netmask"]) - 1)))))
+        mask = int.from_bytes(socket.inet_aton(smaller_netmask), "big")
+        ip1 = int.from_bytes(socket.inet_aton(route_1["network"]), "big")
+        ip2 = int.from_bytes(socket.inet_aton(route_2["network"]), "big")
+
+        if (ip1 & mask) == (ip2 & mask):
+            return {"src": route_1["src"], "network": socket.inet_ntoa(struct.pack("!L", ip1 & mask)), "netmask": smaller_netmask, "peer": route_1["peer"], "localpref": route_1["localpref"], "ASPath": route_1["ASPath"], "selfOrigin": route_1["selfOrigin"], "origin": route_1["origin"]}
+        return None
+
+    # add routing information to forwarding table and send announcement to neighbors
+    def handle_update(self, msg, raw_msg, srcif):
+        print("Received updated message '%s' from %s" % (msg, srcif))
+        # add raw message to previous updates in case we need to use them again
+        previous_updates.append(raw_msg)
+        msgData = copy.deepcopy(msg["msg"])
+        storeData = {"src": msg["src"], "network": msgData["network"], "netmask": msgData["netmask"], "peer": srcif, "localpref": msgData["localpref"], 
+        "ASPath": msgData["ASPath"], "selfOrigin": msgData["selfOrigin"], "origin": msgData["origin"]}
+        # update forwarding table
+        self.updateForwardingTable(storeData)
+
+        # update ASPath info
+        msg["msg"]["ASPath"].insert(0, self.asn)
+        # remove private information that shouldn't be sent out
+        del msg["msg"]["localpref"]
+        del msg["msg"]["selfOrigin"]
+        del msg["msg"]["origin"]
+        # send to neighbors
+        self.initiateAnnouncement(msg, srcif)
+
+    # deliver data to the next hop according to forwarding table
+    def handle_data(self, data_msg, raw_msg, srcif):
+        print("Received data message '%s' from %s" % (data_msg, srcif))
+        
+        # there could be multiple dest in forwarding table that match dest in packet
+        possibleDestinations = []
+
+        # forwarding table contains two entries with ranges that overlap
+        # choose the entry with longest prefix match (bigger netmask)
+        possibleDestinations0 = []
+        for entry in forwarding_table:
+            if self.entryMatches(entry, data_msg["dst"]):
+                possibleDestinations0.append(entry)
+
+        longestPrefix = max([self.netmask_to_cidr(dest["netmask"]) for dest in possibleDestinations0])
+
+        for entry in possibleDestinations0:
+            if self.netmask_to_cidr(entry["netmask"]) == longestPrefix:
+                possibleDestinations.append(entry)
+
+        # forwarding table contains multiple entries for the network with longest prefix
+        # choose the entry with highest localpref (weight)
+        if len(possibleDestinations) > 1:
+            routes = []
+            highestLocalPref = max([dest["localpref"] for dest in possibleDestinations])
+            for dest in possibleDestinations:
+                if dest["localpref"] == highestLocalPref:
+                    routes.append(dest)
+            possibleDestinations = routes
+
+        # forwarding table contains multiple entries with same localprefs
+        # choose the entry with selfOrigin as true
+        if len(possibleDestinations) > 1:
+            routes = []
+            for dest in possibleDestinations:
+                if dest["selfOrigin"]:
+                    routes.append(dest)
+            if len(routes) > 0:
+                possibleDestinations = routes
+
+        # forwarding table contains multiple entries with same selfOrigin
+        # choose the entry with shortest ASPath
+        if len(possibleDestinations) > 1:
+            routes = []
+            shortestASPath = min([len(dest["ASPath"]) for dest in possibleDestinations])
+            for dest in possibleDestinations:
+                if len(dest["ASPath"]) == shortestASPath:
+                    routes.append(dest)
+            possibleDestinations = routes
+
+        # forwarding table contains multiple entries with same length ASPaths
+        # choose the entry with best origin (where IGP > EGP > UNK)
+        if len(possibleDestinations) > 1:
+            if 'IGP' in [dest["origin"] for dest in possibleDestinations]:
+                possibleDestinations = [dest for dest in possibleDestinations if dest["origin"] == 'IGP']
+            elif 'EGP' in [dest["origin"] for dest in possibleDestinations]:
+                possibleDestinations = [dest for dest in possibleDestinations if dest["origin"] == 'EGP']
+
+        # forwarding table contains multiple entries with same origin
+        # choose the entry with lowest IP address
+        if len(possibleDestinations) > 1:
+            routes = []
+            lowestIP = 255255255255
+            for dest in possibleDestinations:
+                if int("".join((dest["peer"]).split('.'))) < lowestIP:
+                    lowestIP = int("".join((dest["peer"]).split('.')))
+                    routes.insert(0, dest)
+            possibleDestinations = routes
+
+        # there is no route to given dest network
+        if len(possibleDestinations) == 0:
+            # send "no route" message back to source that sent data
+            message = { "src": "<destination IP>", "dst": "<destination IP>", "type": "no route", "msg": {}, }
+            self.send(srcif, json.dumps(message))
+            return
+
+        # construct message to send with correct dest
+        bestDest = possibleDestinations[0]
+        srcType = self.relations[srcif]
+        destType = self.relations[bestDest["src"]]
+        # send only if source or destination router is a customer (always send to customers)
+        if srcType == "cust" or destType == "cust":
+            self.send(bestDest["peer"], raw_msg)
+    
+    # withdraw message and rebuild forwarding table
+    def handle_withdraw(self, withdraw_msg, srcif):
+        print("Received withdraw message '%s' from %s" % (withdraw_msg, srcif), flush=True,)
+
+        global previous_updates
+        previous_updates0 = []
+
+        # remove messsage that matches withdraw message from previous updates
+        for pUpdate in previous_updates:
+            if not self.checkUpdateWithdrawMatch(json.loads(pUpdate), withdraw_msg):
+                previous_updates0.append(pUpdate)
+        previous_updates = previous_updates0
+
+        forwarding_table.clear()
+
+        # add rest previous updates back into forwarding table
+        for pUpdate in previous_updates:
+            msg = json.loads(pUpdate)
+            msgData = copy.deepcopy(msg["msg"])
+            storeData = {"src": msg["src"], "network": msgData["network"], "netmask": msgData["netmask"], "peer": msg["src"], "localpref": msgData["localpref"], "ASPath": msgData["ASPath"], "selfOrigin": msgData["selfOrigin"], "origin": msgData["origin"]}
+            self.updateForwardingTable(storeData)
+
+        print("Updated forwarding table")
+        self.initiateAnnouncement(withdraw_msg, srcif)
+
+    # dump entries in forwarding table
+    def handle_dump(self, data_msg, srcif):
+        print("Received dump message '%s' from %s" % (data_msg, srcif))
+
+        # create table to send back
+        table = {"type": "table", "src": self.our_addr(srcif), "dst": self.neighbor_addr(srcif), "msg": []}
+        for entry in forwarding_table:
+            entryDumpForm = { "network": entry["network"], "netmask": entry["netmask"], "peer": entry["peer"], "localpref": entry["localpref"], "ASPath": entry["ASPath"], "selfOrigin": entry["selfOrigin"], "origin": entry["origin"], }
+            table["msg"].append(entryDumpForm)
+        table = json.dumps(table)
+
+        print("Dumping table %s to %s" % (table, srcif))
+        self.send(srcif, table)
+    
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        # router that sent you a message
+                        srcif = sock
+                        break
+                raw_msg = k.decode("utf-8")
+                msg = json.loads(raw_msg)
+
+                print("Received message '%s' from %s" % (msg, srcif))
+
+                if msg["type"] == "update":
+                    self.handle_update(msg, raw_msg, srcif)
+                elif msg["type"] == "data":
+                    self.handle_data(msg, raw_msg, srcif)
+                elif msg["type"] == "withdraw":
+                    self.handle_withdraw(msg, srcif)
+                elif msg["type"] == "dump":
+                    self.handle_dump(msg, srcif)
+                elif msg["type"] == "handshake":
+                    print("Received handshake message '%s' from %s" % (msg, srcif))
+                elif msg["type"] == "no route":
+                    print("Received no route message '%s' from %s" % (msg, srcif))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
